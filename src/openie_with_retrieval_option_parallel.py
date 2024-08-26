@@ -10,6 +10,7 @@ from glob import glob
 
 import numpy as np
 from langchain_openai import ChatOpenAI
+from langchain_together import ChatTogether
 
 import ipdb
 from multiprocessing import Pool
@@ -19,46 +20,83 @@ from src.langchain_util import init_langchain_model
 from src.openie_extraction_instructions import ner_prompts, openie_post_ner_prompts
 from src.processing import extract_json_dict
 
+from vllm import LLM, SamplingParams
+import pickle
+
+openie_errors = {}
 
 def print_messages(messages):
     for message in messages:
         print(message['content'])
 
 
+def turn_to_llama3_chat(messages):
+
+    prompt = ''
+    
+    eot = '<|eot_id|>'
+    system = '<|start_header_id|>system<|end_header_id|>'
+    user = '<|start_header_id|>user<|end_header_id|>'
+    assistant = '<|start_header_id|>assistant<|end_header_id|>'
+
+    for message in messages:
+        if message.type == 'system':
+            prompt += system + ' ' + message.content + eot + '\n'
+        elif message.type == 'human':
+            prompt += user + ' ' + message.content + eot + '\n'
+        elif message.type == 'ai':
+            prompt += assistant + ' ' + message.content + eot + '\n'
+
+    prompt += assistant + ' '
+    
+    return prompt
+
 def named_entity_recognition(passage: str):
     ner_messages = ner_prompts.format_prompt(user_input=passage)
-
-    not_done = True
 
     total_tokens = 0
     response_content = '{}'
 
-    while not_done:
+    error = True
+    while error:
         try:
             if isinstance(client, ChatOpenAI):  # JSON mode
                 chat_completion = client.invoke(ner_messages.to_messages(), temperature=0, response_format={"type": "json_object"})
                 response_content = chat_completion.content
-                response_content = eval(response_content)
-                total_tokens += chat_completion.response_metadata['token_usage']['total_tokens']
             elif isinstance(client, ChatOllama) or isinstance(client, ChatLlamaCpp):
                 response_content = client.invoke(ner_messages.to_messages())
-                response_content = extract_json_dict(response_content)
-                total_tokens += len(response_content.split())
-            else:  # no JSON mode
+            elif isinstance(client, ChatTogether):
                 chat_completion = client.invoke(ner_messages.to_messages(), temperature=0)
                 response_content = chat_completion.content
-                response_content = extract_json_dict(response_content)
-                total_tokens += chat_completion.response_metadata['token_usage']['total_tokens']
-
-            if 'named_entities' not in response_content:
-                response_content = []
             else:
-                response_content = response_content['named_entities']
+                prompt = turn_to_llama3_chat(ner_messages.to_messages())
+                sampling_params = SamplingParams(temperature=0.0, max_tokens=200)
+                response_content = client.generate(prompt, sampling_params)[0].outputs[0].text
 
-            not_done = False
+            error = False
         except Exception as e:
-            print('Passage NER exception')
             print(e)
+
+    try:
+        if isinstance(client, ChatOpenAI):  # JSON mode    
+            response_content = eval(response_content)
+            total_tokens += chat_completion.response_metadata['token_usage']['total_tokens']
+        elif isinstance(client, ChatOllama) or isinstance(client, ChatLlamaCpp):
+            response_content = extract_json_dict(response_content)
+            total_tokens += len(response_content.split())
+        elif isinstance(client, ChatTogether):
+            response_content = extract_json_dict(response_content)
+            total_tokens += chat_completion.response_metadata['token_usage']['total_tokens']
+        else:
+            response_content = extract_json_dict(response_content)
+    
+        if 'named_entities' not in response_content:
+            response_content = []
+        else:
+            response_content = response_content['named_entities']
+    except Exception as e:
+        print('Passage NER exception')
+        print(e)
 
     return response_content, total_tokens
 
@@ -67,26 +105,31 @@ def openie_post_ner_extract(passage: str, entities: list, model: str):
     named_entity_json = {"named_entities": entities}
     openie_messages = openie_post_ner_prompts.format_prompt(passage=passage, named_entity_json=json.dumps(named_entity_json))
 
-    try:
-        if isinstance(client, ChatOpenAI):  # JSON mode
-            chat_completion = client.invoke(openie_messages.to_messages(), temperature=0, max_tokens=4096, response_format={"type": "json_object"})
-            response_content = chat_completion.content
-            total_tokens = chat_completion.response_metadata['token_usage']['total_tokens']
-        elif isinstance(client, ChatOllama) or isinstance(client, ChatLlamaCpp):
-            response_content = client.invoke(openie_messages.to_messages())
-            response_content = extract_json_dict(response_content)
-            response_content = str(response_content)
-            total_tokens = len(response_content.split())
-        else:  # no JSON mode
-            chat_completion = client.invoke(openie_messages.to_messages(), temperature=0, max_tokens=4096)
-            response_content = chat_completion.content
-            response_content = extract_json_dict(response_content)
-            response_content = str(response_content)
-            total_tokens = chat_completion.response_metadata['token_usage']['total_tokens']
+    response_content = '{}'
 
-    except Exception as e:
-        print('OpenIE exception', e)
-        return '', 0
+    error = True
+    while error:
+        try:
+            if isinstance(client, ChatOpenAI):  # JSON mode
+                chat_completion = client.invoke(openie_messages.to_messages(), temperature=0, max_tokens=4096, response_format={"type": "json_object"})
+                response_content = chat_completion.content
+                total_tokens = chat_completion.response_metadata['token_usage']['total_tokens']
+            elif isinstance(client, ChatOllama) or isinstance(client, ChatLlamaCpp):
+                response_content = client.invoke(openie_messages.to_messages())
+                total_tokens = len(response_content.split())        
+            elif isinstance(client, ChatTogether):
+                chat_completion = client.invoke(openie_messages.to_messages(), temperature=0, max_tokens=4096)
+                response_content = chat_completion.content
+                total_tokens = chat_completion.response_metadata['token_usage']['total_tokens']
+            else:                
+                prompt = turn_to_llama3_chat(openie_messages.to_messages())
+                sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
+                response_content = client.generate(prompt, sampling_params)[0].outputs[0].text
+                total_tokens = 0
+
+            error = False
+        except Exception as e:
+            print(e)
 
     return response_content, total_tokens
 
@@ -136,7 +179,11 @@ if __name__ == '__main__':
 
     print(arg_str)
 
-    client = init_langchain_model(args.llm, model_name)  # LangChain model
+    if args.llm == 'vllm':
+        client = LLM(model=model_name, tensor_parallel_size=4)
+    else:
+        client = init_langchain_model(args.llm, model_name)  # LangChain model
+        
     already_done = False
 
     try:
@@ -195,6 +242,11 @@ if __name__ == '__main__':
             passage = r['passage']
 
             if i < len(existing_json):
+                triples = existing_json[i]['extracted_triples']
+            else:
+                triples = None
+            
+            if triples is not None and len(triples) > 0:
                 new_json.append(existing_json[i])
             else:
                 if auxiliary_file_exists:
@@ -208,17 +260,19 @@ if __name__ == '__main__':
                     ents_by_doc.append(doc_entities)
 
                 triples, total_tokens = openie_post_ner_extract(passage, doc_entities, model_name)
-
                 chatgpt_total_tokens += total_tokens
 
                 r['extracted_entities'] = doc_entities
 
                 try:
+                    if not(isinstance(client, ChatOpenAI)):
+                        triples = extract_json_dict(triples)
+                        triples = str(triples)
                     r['extracted_triples'] = eval(triples)["triples"]
-                except:
-                    print('ERROR')
-                    print(triples)
+                except Exception as e:
+                    print('OpenIE exception', e)
                     r['extracted_triples'] = []
+                    openie_errors[passage] = triples
 
                 new_json.append(r)
 
@@ -251,20 +305,22 @@ if __name__ == '__main__':
         all_entities.extend(output[1])
         lm_total_tokens += output[2]
 
-    if not (already_done):
-        avg_ent_chars = np.mean([len(e) for e in all_entities])
-        avg_ent_words = np.mean([len(e.split()) for e in all_entities])
+    # if not (already_done):
+    avg_ent_chars = np.mean([len(e) for e in all_entities])
+    avg_ent_words = np.mean([len(e.split()) for e in all_entities])
 
-        # Current Cost
-        approx_total_tokens = (len(retrieval_corpus) / num_passages) * lm_total_tokens
+    # Current Cost
+    approx_total_tokens = (len(retrieval_corpus) / num_passages) * lm_total_tokens
 
-        extra_info_json = {"docs": new_json,
-                           "ents_by_doc": ents_by_doc,
-                           "avg_ent_chars": avg_ent_chars,
-                           "avg_ent_words": avg_ent_words,
-                           "num_tokens": lm_total_tokens,
-                           "approx_total_tokens": approx_total_tokens,
-                           }
-        output_path = 'output/openie{}_results_{}.json'.format(dataset, arg_str)
-        json.dump(extra_info_json, open(output_path, 'w'))
-        print('OpenIE saved to', output_path)
+    extra_info_json = {"docs": new_json,
+                       "ents_by_doc": ents_by_doc,
+                       "avg_ent_chars": avg_ent_chars,
+                       "avg_ent_words": avg_ent_words,
+                       "num_tokens": lm_total_tokens,
+                       "approx_total_tokens": approx_total_tokens,
+                       }
+    output_path = 'output/openie{}_results_{}.json'.format(dataset, arg_str)
+    json.dump(extra_info_json, open(output_path, 'w'))
+    errors_path = 'output/openie{}_errors_{}.p'.format(dataset, arg_str)
+    pickle.dump(openie_errors, open(errors_path, 'wb'))
+    print('OpenIE saved to', output_path)
