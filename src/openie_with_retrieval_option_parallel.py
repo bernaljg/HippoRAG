@@ -13,7 +13,7 @@ from langchain_openai import ChatOpenAI
 from langchain_together import ChatTogether
 
 import ipdb
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 from tqdm import tqdm
 
 from src.langchain_util import init_langchain_model
@@ -22,6 +22,9 @@ from src.processing import extract_json_dict
 
 from vllm import LLM, SamplingParams
 import pickle
+
+import traceback
+from datetime import datetime
 
 openie_errors = {}
 
@@ -51,14 +54,47 @@ def turn_to_llama3_chat(messages):
     
     return prompt
 
-def named_entity_recognition(passage: str):
+
+def exception_handling(e, exception_log_filepath='output/exceptions.log', lock=None):
+    error_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if lock:
+        with lock:
+            with open(exception_log_filepath, 'a') as f:
+                f.write(f"Error occurred at: {error_time}\n\n")
+                
+                error_message = str(e)
+                f.write(f"Exception message: {error_message}\n\n")
+                f.write("Full traceback:\n")
+                traceback.print_exc(file=f)
+                
+
+            print(f"Error occurred at: {error_time}")
+            print(f"Exception message: {error_message}")
+            traceback.print_exc()
+    else:
+        with open(exception_log_filepath, 'a') as f:
+            f.write(f"Error occurred at: {error_time}\n\n")
+            
+            error_message = str(e)
+            f.write(f"Exception message: {error_message}\n\n")
+            f.write("Full traceback:\n")
+            traceback.print_exc(file=f)
+            
+
+        print(f"Error occurred at: {error_time}")
+        print(f"Exception message: {error_message}")
+        traceback.print_exc()
+        
+        
+def named_entity_recognition(passage: str, num_max_retries: int=1, lock=None):
     ner_messages = ner_prompts.format_prompt(user_input=passage)
 
     total_tokens = 0
     response_content = '{}'
 
-    error = True
-    while error:
+    num_retries = 0
+    while num_retries <= num_max_retries:
         try:
             if isinstance(client, ChatOpenAI):  # JSON mode
                 chat_completion = client.invoke(ner_messages.to_messages(), temperature=0, response_format={"type": "json_object"})
@@ -73,10 +109,12 @@ def named_entity_recognition(passage: str):
                 sampling_params = SamplingParams(temperature=0.0, max_tokens=200)
                 response_content = client.generate(prompt, sampling_params)[0].outputs[0].text
 
-            error = False
+            break
+        
         except Exception as e:
-            print(e)
-
+            num_retries += 1
+            exception_handling(e=e, exception_log_filepath='output/llm_exceptions.log', lock=lock)
+        
     try:
         if isinstance(client, ChatOpenAI):  # JSON mode    
             response_content = eval(response_content)
@@ -96,19 +134,23 @@ def named_entity_recognition(passage: str):
             response_content = response_content['named_entities']
     except Exception as e:
         print('Passage NER exception')
-        print(e)
-
+        # print(e)
+        response_content = []
+        exception_handling(e=e, exception_log_filepath='output/NER_exceptions.log', lock=lock)
+                
     return response_content, total_tokens
 
 
-def openie_post_ner_extract(passage: str, entities: list, model: str):
+def openie_post_ner_extract(passage: str, entities: list, model: str, num_max_retries: int=1, lock=None):
     named_entity_json = {"named_entities": entities}
     openie_messages = openie_post_ner_prompts.format_prompt(passage=passage, named_entity_json=json.dumps(named_entity_json))
 
     response_content = '{}'
 
-    error = True
-    while error:
+    
+    num_retries = 0
+
+    while num_retries <= num_max_retries:
         try:
             if isinstance(client, ChatOpenAI):  # JSON mode
                 chat_completion = client.invoke(openie_messages.to_messages(), temperature=0, max_tokens=4096, response_format={"type": "json_object"})
@@ -127,10 +169,14 @@ def openie_post_ner_extract(passage: str, entities: list, model: str):
                 response_content = client.generate(prompt, sampling_params)[0].outputs[0].text
                 total_tokens = 0
 
-            error = False
+            break
+        
         except Exception as e:
-            print(e)
-
+            # print(e)
+            num_retries += 1
+            exception_handling(e=e, exception_log_filepath='output/llm_exceptions.log', lock=lock)
+            
+            
     return response_content, total_tokens
 
 
@@ -230,7 +276,7 @@ if __name__ == '__main__':
                 break
 
 
-    def extract_openie_from_triples(triple_json):
+    def extract_openie_from_triples(triple_json, lock=None):
 
         new_json = []
         all_entities = []
@@ -252,14 +298,14 @@ if __name__ == '__main__':
                 if auxiliary_file_exists:
                     doc_entities = ents_by_doc[i]
                 else:
-                    doc_entities, total_ner_tokens = named_entity_recognition(passage)
+                    doc_entities, total_ner_tokens = named_entity_recognition(passage, lock=lock)
 
                     doc_entities = list(np.unique(doc_entities))
                     chatgpt_total_tokens += total_ner_tokens
 
                     ents_by_doc.append(doc_entities)
 
-                triples, total_tokens = openie_post_ner_extract(passage, doc_entities, model_name)
+                triples, total_tokens = openie_post_ner_extract(passage, doc_entities, model_name, lock=lock)
                 chatgpt_total_tokens += total_tokens
 
                 r['extracted_entities'] = doc_entities
@@ -273,7 +319,9 @@ if __name__ == '__main__':
                     print('OpenIE exception', e)
                     r['extracted_triples'] = []
                     openie_errors[passage] = triples
-
+                    exception_handling(e=e, exception_log_filepath='output/triple_exceptions.log', lock=lock)
+                    
+                    
                 new_json.append(r)
 
         return (new_json, all_entities, chatgpt_total_tokens)
@@ -291,8 +339,10 @@ if __name__ == '__main__':
         args.append([(i, extracted_triples_subset[i]) for i in split])
 
     if num_processes > 1:
-        with Pool(processes=num_processes) as pool:
-            outputs = pool.map(extract_openie_from_triples, args)
+        with Manager() as manager:
+            lock = manager.Lock()  # shared lock for writing to the log
+            with Pool(processes=num_processes) as pool:
+                outputs = pool.starmap(extract_openie_from_triples, [(arg, lock) for arg in args])
     else:
         outputs = [extract_openie_from_triples(arg) for arg in args]
 
